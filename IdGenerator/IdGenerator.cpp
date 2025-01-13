@@ -1,128 +1,148 @@
-#include <cpprest/http_listener.h>
-#include <cpprest/json.h>
-#include <iostream>
-#include <mutex>
-#include <chrono>
-#include <thread>
-#include <vector>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <microhttpd.h>
+#include <pthread.h>
+#include <time.h>
 
-using namespace web;
-using namespace web::http;
-using namespace web::http::experimental::listener;
-using namespace std;
+#define EPOCH 1622505600000 
+#define WORKER_ID_BITS 5
+#define DATACENTER_ID_BITS 5
+#define SEQUENCE_BITS 12
 
-class SnowflakeIdGenerator {
-public:
-    static const int64_t EPOCH = 1622505600000; 
-    static const int64_t WORKER_ID_BITS = 5;
-    static const int64_t DATACENTER_ID_BITS = 5;
-    static const int64_t SEQUENCE_BITS = 12;
+#define MAX_WORKER_ID ((1 << WORKER_ID_BITS) - 1)
+#define MAX_DATACENTER_ID ((1 << DATACENTER_ID_BITS) - 1)
+#define SEQUENCE_MASK ((1 << SEQUENCE_BITS) - 1)
 
-    static const int64_t MAX_WORKER_ID = (1 << WORKER_ID_BITS) - 1;
-    static const int64_t MAX_DATACENTER_ID = (1 << DATACENTER_ID_BITS) - 1;
-    static const int64_t SEQUENCE_MASK = (1 << SEQUENCE_BITS) - 1;
+#define WORKER_ID_SHIFT SEQUENCE_BITS
+#define DATACENTER_ID_SHIFT (SEQUENCE_BITS + WORKER_ID_BITS)
+#define TIMESTAMP_LEFT_SHIFT (SEQUENCE_BITS + WORKER_ID_BITS + DATACENTER_ID_BITS)
 
-    static const int64_t WORKER_ID_SHIFT = SEQUENCE_BITS;
-    static const int64_t DATACENTER_ID_SHIFT = SEQUENCE_BITS + WORKER_ID_BITS;
-    static const int64_t TIMESTAMP_LEFT_SHIFT = SEQUENCE_BITS + WORKER_ID_BITS + DATACENTER_ID_BITS;
+static long workerId = 1;  
+static long datacenterId = 1; 
+static long lastTimestamp = 0;
+static long sequence = 0;
+static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 
-    SnowflakeIdGenerator(int64_t workerId, int64_t datacenterId) : workerId(workerId), datacenterId(datacenterId) {
-        if (workerId > MAX_WORKER_ID || workerId < 0 || datacenterId > MAX_DATACENTER_ID || datacenterId < 0) {
-            throw std::invalid_argument("Worker ID or Datacenter ID out of range");
+
+long currentMillis() {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+
+long waitForNextMillis(long lastTimestamp) {
+    long timestamp = currentMillis();
+    while (timestamp <= lastTimestamp) {
+        timestamp = currentMillis();
+    }
+    return timestamp;
+}
+
+long nextId() {
+    pthread_mutex_lock(&mutex);
+
+    long timestamp = currentMillis();
+
+    if (timestamp < lastTimestamp) {
+        pthread_mutex_unlock(&mutex);
+        return -1;
+    }
+
+    if (timestamp == lastTimestamp) {
+        sequence = (sequence + 1) & SEQUENCE_MASK;
+        if (sequence == 0) {
+            timestamp = waitForNextMillis(lastTimestamp);
         }
-        lastTimestamp = 0;
+    } else {
         sequence = 0;
     }
 
-    int64_t nextId() {
-        lock_guard<mutex> lock(mtx);
-        int64_t timestamp = currentMillis();
-        if (timestamp < lastTimestamp) {
-            throw std::runtime_error("Clock moved backwards. Refusing to generate ID");
-        }
+    lastTimestamp = timestamp;
 
-        if (timestamp == lastTimestamp) {
-            sequence = (sequence + 1) & SEQUENCE_MASK;
-            if (sequence == 0) {
-                timestamp = waitForNextMillis(lastTimestamp);
-            }
-        } else {
-            sequence = 0;
-        }
+    long id = ((timestamp - EPOCH) << TIMESTAMP_LEFT_SHIFT) |
+              (datacenterId << DATACENTER_ID_SHIFT) |
+              (workerId << WORKER_ID_SHIFT) |
+              sequence;
 
-        lastTimestamp = timestamp;
-
-        return ((timestamp - EPOCH) << TIMESTAMP_LEFT_SHIFT) |
-               (datacenterId << DATACENTER_ID_SHIFT) |
-               (workerId << WORKER_ID_SHIFT) |
-               sequence;
-    }
-
-    vector<int64_t> generateIds(int count) {
-        vector<int64_t> ids;
-        for (int i = 0; i < count; ++i) {
-            ids.push_back(nextId());
-        }
-        return ids;
-    }
-
-private:
-    int64_t workerId;
-    int64_t datacenterId;
-    int64_t lastTimestamp;
-    int64_t sequence;
-    mutex mtx;
-
-    int64_t currentMillis() {
-        return chrono::duration_cast<chrono::milliseconds>(chrono::system_clock::now().time_since_epoch()).count();
-    }
-
-    int64_t waitForNextMillis(int64_t lastTimestamp) {
-        int64_t timestamp = currentMillis();
-        while (timestamp <= lastTimestamp) {
-            timestamp = currentMillis();
-        }
-        return timestamp;
-    }
-};
-
-void handleGenerateId(http_request request) {
-    static SnowflakeIdGenerator generator(1, 1); 
-
-    int64_t id = generator.nextId();
-    json::value response_data;
-    response_data[U("id")] = json::value::number(id);
-
-    request.reply(status_codes::OK, response_data);
+    pthread_mutex_unlock(&mutex);
+    return id;
 }
 
-void handleGenerateIds(http_request request) {
-    static SnowflakeIdGenerator generator(1, 1); 
+int generateIdHandler(void *cls, struct MHD_Connection *connection, const char *url, const char *method,
+                        const char *version, const char *upload_data, size_t *upload_data_size, void **con_cls) {
+    long id = nextId();
+    if (id == -1) {
+        const char *error_msg = "Clock moved backwards. Cannot generate ID.";
+        struct MHD_Response *response = MHD_create_response_from_buffer(strlen(error_msg), (void *)error_msg,
+                                                                        MHD_RESPMEM_PERSISTENT);
+        int ret = MHD_queue_response(connection, MHD_HTTP_INTERNAL_SERVER_ERROR, response);
+        MHD_destroy_response(response);
+        return ret;
+    }
 
-    vector<int64_t> ids = generator.generateIds(10); 
-    json::value response_data;
-    response_data[U("ids")] = json::value::array(ids.begin(), ids.end());
+    char response_str[256];
+    snprintf(response_str, sizeof(response_str), "{\"id\": %ld}", id);
 
-    request.reply(status_codes::OK, response_data);
+    struct MHD_Response *response = MHD_create_response_from_buffer(strlen(response_str), (void *)response_str,
+                                                                    MHD_RESPMEM_PERSISTENT);
+    int ret = MHD_queue_response(connection, MHD_HTTP_OK, response);
+    MHD_destroy_response(response);
+    return ret;
+}
+
+int generateIdsHandler(void *cls, struct MHD_Connection *connection, const char *url, const char *method,
+                         const char *version, const char *upload_data, size_t *upload_data_size, void **con_cls) {
+    int num_ids = 10; 
+    char response_str[1024];
+    char id_str[64];
+    int offset = 0;
+
+    for (int i = 0; i < num_ids; i++) {
+        long id = nextId();
+        if (id == -1) {
+            const char *error_msg = "Clock moved backwards. Cannot generate IDs.";
+            struct MHD_Response *response = MHD_create_response_from_buffer(strlen(error_msg), (void *)error_msg,
+                                                                            MHD_RESPMEM_PERSISTENT);
+            int ret = MHD_queue_response(connection, MHD_HTTP_INTERNAL_SERVER_ERROR, response);
+            MHD_destroy_response(response);
+            return ret;
+        }
+
+        snprintf(id_str, sizeof(id_str), "%ld", id);
+        if (i == 0) {
+            snprintf(response_str + offset, sizeof(response_str) - offset, "[%s", id_str);
+        } else {
+            snprintf(response_str + offset, sizeof(response_str) - offset, ", %s", id_str);
+        }
+        offset += strlen(id_str) + 2;
+    }
+
+    snprintf(response_str + offset, sizeof(response_str) - offset, "]");
+
+    struct MHD_Response *response = MHD_create_response_from_buffer(strlen(response_str), (void *)response_str,
+                                                                    MHD_RESPMEM_PERSISTENT);
+    int ret = MHD_queue_response(connection, MHD_HTTP_OK, response);
+    MHD_destroy_response(response);
+    return ret;
+}
+
+void startServer() {
+    struct MHD_Daemon *daemon = MHD_start_daemon(MHD_USE_THREAD_PER_CONNECTION, 8080, NULL, NULL,
+                                                 &generateIdHandler, NULL, MHD_OPTION_END);
+    if (daemon == NULL) {
+        fprintf(stderr, "Failed to start HTTP server\n");
+        exit(1);
+    }
+
+    printf("Server started on http://localhost:8080\n");
+    MHD_start_daemon(MHD_USE_THREAD_PER_CONNECTION, 8080, NULL, NULL, &generateIdsHandler, NULL,
+                     MHD_OPTION_URI, "/generate-ids", MHD_OPTION_END);
 }
 
 int main() {
-    uri_builder uri(U("http://localhost:8080"));
-    auto addr = uri.to_uri().to_string();
-
-    http_listener listener(addr);
-
-    listener.support(methods::GET, handleGenerateId);     
-    listener.support(methods::GET, handleGenerateIds);     
-
-    try {
-        listener
-            .open()
-            .then([&addr](){ std::wcout << L"Starting to listen at: " << addr << std::endl; })
-            .wait();
-    } catch (const exception& e) {
-        std::cerr << "Error occurred: " << e.what() << std::endl;
-    }
-
+    startServer();
+    getchar(); 
     return 0;
 }
